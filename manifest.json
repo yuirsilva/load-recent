@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Instagram Oldest First",
+  "version": "1.1.1",
+  "description": "Loads an Instagram profile in place, then shows its existing post grid oldest first.",
+  "host_permissions": [
+    "https://www.instagram.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.instagram.com/*"
+      ],
+      "js": [
+        "page-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.instagram.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "toggle-oldest-first": {
+      "suggested_key": {
+        "default": "Alt+Shift+O"
+      },
+      "description": "Load the current Instagram profile oldest first"
+    }
+  }
+}
