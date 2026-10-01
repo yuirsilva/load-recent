@@ -3,14 +3,102 @@
 
   const COMMAND_EVENT = "instagram-oldest-first:relay-command";
   const PROGRESS_EVENT = "instagram-oldest-first:relay-progress";
-  const ENGINE_VERSION = "relay-cache-v1";
+  const ENGINE_VERSION = "relay-cache-v3";
   const CACHE_DB_NAME = "instagram-oldest-first-cache";
   const CACHE_STORE_NAME = "profiles";
+  const CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+  const CACHE_EXPIRY_SAFETY_MS = 5 * 60 * 1000;
+  const CACHE_FALLBACK_AGE_MS = 15 * 60 * 1000;
   const CONNECTION_KEY =
     "PolarisProfilePostsTabContentQuery_connection_xdt_api__v1__feed__user_timeline_graphql_connection";
+  const ROOT_FIELD = "xdt_api__v1__feed__user_timeline_graphql_connection";
+
+  const PAGINATION_VARIABLES = new Set(["after", "before", "first", "last", "username"]);
+  const DEFAULT_QUERY_VARIABLES = {
+    data: {
+      count: 12,
+      include_reel_media_seen_timestamp: true,
+      include_relationship_info: true,
+      latest_besties_reel_media: true,
+      latest_reel_media: true
+    },
+    include_multi_captions: false
+  };
 
   let runToken = 0;
   let activeSession = null;
+  let observedQueryVariables = null;
+  let lastPageResponse = null;
+
+  function rememberQueryVariables(body) {
+    try {
+      const params = body instanceof URLSearchParams
+        ? body
+        : typeof body === "string" ? new URLSearchParams(body) : null;
+      if (!params) return "";
+      const name = params.get("fb_api_req_friendly_name") || "";
+      if (!name.startsWith("PolarisProfilePosts")) return "";
+      const variables = JSON.parse(params.get("variables") || "null");
+      if (!variables || typeof variables !== "object") return name;
+      const kept = {};
+      for (const [key, value] of Object.entries(variables)) {
+        if (!PAGINATION_VARIABLES.has(key)) kept[key] = value;
+      }
+      observedQueryVariables = { ...observedQueryVariables, ...kept };
+      return name;
+    } catch {
+      return "";
+    }
+  }
+
+  function rememberPageResponse(name, status, text) {
+    if (name !== "PolarisProfilePostsTabContentQuery_connection") return;
+    lastPageResponse = { status, text: String(text ?? "") };
+  }
+
+  const nativeSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function send(body) {
+    const name = rememberQueryVariables(body);
+    if (name) {
+      this.addEventListener("loadend", () => {
+        let text = "";
+        try { text = this.responseType === "" || this.responseType === "text" ? this.responseText : `[${this.responseType}]`; } catch {}
+        rememberPageResponse(name, this.status, text);
+      });
+    }
+    return nativeSend.apply(this, arguments);
+  };
+
+  const nativeFetch = window.fetch;
+  window.fetch = function fetch(input, init) {
+    const name = rememberQueryVariables(init?.body);
+    const result = nativeFetch.apply(this, arguments);
+    if (name) {
+      result.then((response) => response.clone().text()
+        .then((text) => rememberPageResponse(name, response.status, text)))
+        .catch(() => {});
+    }
+    return result;
+  };
+
+  function queryVariables(query, cursor, username) {
+    const variables = {
+      ...DEFAULT_QUERY_VARIABLES,
+      ...observedQueryVariables,
+      after: cursor,
+      before: null,
+      first: 12,
+      last: null,
+      username
+    };
+    // Fill any variable Instagram added to the query that we don't know about yet.
+    const definitions = query.fragment?.argumentDefinitions || query.operation?.argumentDefinitions || [];
+    for (const definition of definitions) {
+      if (definition.name in variables) continue;
+      variables[definition.name] = definition.defaultValue ?? null;
+    }
+    return variables;
+  }
 
   function openCacheDatabase() {
     return new Promise((resolve, reject) => {
@@ -63,6 +151,41 @@
       .filter(Boolean);
   }
 
+  function signedMediaExpiry(value) {
+    if (typeof value !== "string" || !value.startsWith("http")) return null;
+
+    try {
+      const url = new URL(value);
+      if (!/(?:^|\.)(?:cdninstagram\.com|fbcdn\.net)$/i.test(url.hostname)) return null;
+      const encodedExpiry = url.searchParams.get("oe");
+      if (!encodedExpiry || !/^[\da-f]+$/i.test(encodedExpiry)) return null;
+
+      const expiry = Number.parseInt(encodedExpiry, 16) * 1000;
+      return Number.isFinite(expiry) ? expiry : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function cacheExpiration(records, savedAt) {
+    let earliestSignedExpiry = Infinity;
+    const pending = [records];
+
+    while (pending.length) {
+      const value = pending.pop();
+      const expiry = signedMediaExpiry(value);
+      if (expiry !== null) earliestSignedExpiry = Math.min(earliestSignedExpiry, expiry);
+      if (!value || typeof value !== "object") continue;
+      pending.push(...Object.values(value));
+    }
+
+    const ageLimit = savedAt + CACHE_MAX_AGE_MS;
+    const mediaLimit = Number.isFinite(earliestSignedExpiry)
+      ? earliestSignedExpiry - CACHE_EXPIRY_SAFETY_MS
+      : savedAt + CACHE_FALLBACK_AGE_MS;
+    return Math.min(ageLimit, mediaLimit);
+  }
+
   function emit(detail) {
     document.dispatchEvent(new CustomEvent(PROGRESS_EVENT, { detail }));
   }
@@ -106,6 +229,20 @@
       CONNECTION_KEY,
       { username }
     );
+  }
+
+  function parseResponseData(text) {
+    // Instagram may send several JSON payloads separated by newlines; the first holds the page.
+    for (const line of String(text || "").split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const payload = JSON.parse(line);
+        if (payload?.data?.[ROOT_FIELD]) return payload;
+      } catch {
+        // Keep looking.
+      }
+    }
+    return null;
   }
 
   function readConnection(environment, id) {
@@ -183,6 +320,8 @@
     if (!Array.isArray(cache.edgeIDs) || !cache.records || !Array.isArray(cache.codes)) {
       return false;
     }
+    if (!Number.isFinite(cache.savedAt) || !Number.isFinite(cache.expiresAt)) return false;
+    if (Date.now() >= cache.expiresAt) return false;
     if (expectedCount && cache.count !== expectedCount) return false;
     const currentCodes = visiblePostCodes();
     if (!currentCodes.length) return false;
@@ -303,30 +442,51 @@
         }
         cursors.add(cursor);
 
-        await observableToPromise(fetchQuery(
-          environment,
-          query,
-          {
-            after: cursor,
-            before: null,
-            data: {
-              count: 12,
-              include_reel_media_seen_timestamp: true,
-              include_relationship_info: true,
-              latest_besties_reel_media: true,
-              latest_reel_media: true
-            },
-            first: 12,
-            last: null,
-            username
-          },
-          { fetchPolicy: "network-only" }
-        ));
+        const variables = queryVariables(query, cursor, username);
+        lastPageResponse = null;
+        let result;
+        try {
+          result = await observableToPromise(fetchQuery(
+            environment,
+            query,
+            variables,
+            { fetchPolicy: "network-only" }
+          ));
+        } catch (error) {
+          throw new Error(`Instagram rejected the page request: ${error?.message || error}`);
+        }
 
         if (token !== runToken) return;
         const current = readConnection(environment, connectionId);
-        if (!current || current.count <= loaded || current.endCursor === cursor) {
-          throw new Error("Instagram did not append the next native Relay page.");
+        // On the last page Instagram returns end_cursor null and Relay keeps the old cursor,
+        // so an unchanged cursor only means trouble when another page is still expected.
+        if (
+          !current ||
+          current.count <= loaded ||
+          (current.hasNextPage && current.endCursor === cursor)
+        ) {
+          console.warn("[Instagram Oldest First] Page did not append.", {
+            variables,
+            result,
+            response: lastPageResponse && { ...lastPageResponse, text: lastPageResponse.text.slice(0, 2000) },
+            before: { count: loaded, cursor },
+            after: current
+          });
+          const page = parseResponseData(lastPageResponse?.text)?.data?.[ROOT_FIELD];
+          const pageCodes = (page?.edges || []).map((edge) => edge?.node?.code).filter(Boolean);
+          const haveCodes = new Set(visiblePostCodes());
+          const detail = [
+            ENGINE_VERSION,
+            `had ${loaded} (start ${original.count})`,
+            `store now ${current?.count ?? "missing"}`,
+            `HTTP ${lastPageResponse?.status ?? "none"}`,
+            `page ${pageCodes.length} posts ${pageCodes[0] ?? "-"}…${pageCodes.at(-1) ?? "-"}`,
+            `${pageCodes.filter((code) => haveCodes.has(code)).length} already shown`,
+            `next ${page?.page_info?.has_next_page}`,
+            `cursor sent ${String(cursor).slice(0, 24)}`,
+            `cursor back ${String(page?.page_info?.end_cursor).slice(0, 24)}`
+          ].join(" · ");
+          throw new Error(`Page did not append [${detail}]`);
         }
         loaded = current.count;
         cursor = current.endCursor;
@@ -338,14 +498,17 @@
       const sorted = sortConnectionOldestFirst(session);
       emit({ phase: "saving", count: sorted.count, total: expectedCount });
       try {
+        const records = collectRecordSnapshot(environment, sorted.edgeIDs);
+        const savedAt = Date.now();
         await writeCachedProfile({
           username: username.toLowerCase(),
           engine: ENGINE_VERSION,
           count: sorted.count,
           codes: sorted.codes,
           edgeIDs: sorted.edgeIDs,
-          records: collectRecordSnapshot(environment, sorted.edgeIDs),
-          savedAt: Date.now()
+          records,
+          savedAt,
+          expiresAt: cacheExpiration(records, savedAt)
         });
       } catch (error) {
         console.warn("[Instagram Oldest First] Could not save the profile cache.", error);

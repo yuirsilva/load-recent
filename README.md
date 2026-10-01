@@ -14,7 +14,7 @@ It deliberately does not simulate scrolling, clone posts, or replace React-owned
 
 The page does not scroll. A visible status chip reports progress while the extension executes Instagram's own profile-post Relay query page by page. When the connection is complete, the extension sorts its native edges oldest-first. Press **Alt+Shift+O** again while loading to stop, or after loading to restore the original connection.
 
-Completed profiles are cached in the browser. On later visits, if the profile's post count and currently visible post IDs still match, the saved native Relay records are restored immediately. A changed count or a newly visible post invalidates the cache and triggers a fresh load.
+Completed profiles are cached briefly in the browser. On later visits, if the profile's post count and currently visible post IDs still match, and Instagram's signed media URLs are still valid, the saved native Relay records are restored immediately. A changed count, a newly visible post, or an expired media signature invalidates the cache and triggers a fresh load.
 
 Chrome lets you change the shortcut at `chrome://extensions/shortcuts` if it conflicts with another extension.
 

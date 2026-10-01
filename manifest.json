@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Instagram Oldest First",
-  "version": "1.1.1",
+  "version": "1.1.8",
   "description": "Loads an Instagram profile in place, then shows its existing post grid oldest first.",
   "host_permissions": [
     "https://www.instagram.com/*"
